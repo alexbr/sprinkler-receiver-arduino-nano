@@ -7,7 +7,7 @@
 #include "main.h"
 
 #include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
+#include <Adafruit_SH110X.h>
 #include <NTPClient.h>
 #include <TimeLib.h>
 #include <Timezone.h>
@@ -15,6 +15,7 @@
 #include <WiFi.h>
 #include <WiFiUDP.h>
 #include <Wire.h>
+#include <string.h>
 
 #include "ButtonHook.h"
 #include "secrets.h"
@@ -25,8 +26,8 @@ SprinklerState sprinklerState = UNKNOWN;
 unsigned long sprinklerStart = 0;
 unsigned long manualOverride = 0;
 time_t sprinklerStartTime = 0;
-char sprinklerStartDisplay[50] = "Start: N/A\n";
-char sprinklerDurationDisplay[50] = "Run: N/A\n";
+char sprinklerStartDisplay[50] = "Hello\n";
+char sprinklerDurationDisplay[50] = "Rodriguez Fam!\n";
 
 time_t lastRunStartTime = 0;
 unsigned long lastRunDurationMs = 0;
@@ -37,8 +38,12 @@ unsigned long checkServerTime = 0;
 unsigned long lastHeapLog = 0;  // for periodic heap logging
 
 // Display
-Adafruit_SSD1306 display = Adafruit_SSD1306(128, 32, &Wire);
+Adafruit_SH1107 display = Adafruit_SH1107(64, 128, &Wire);
 unsigned long turnDisplayOff = 0;
+static int16_t displayScrollOffset = 0;
+static int16_t displayMaxScroll = 0;
+static unsigned long lastDisplayScroll = 0;
+static unsigned long displayScrollEndTime = 0;
 
 // Button handling
 ButtonHook buttonHook(LONG_PRESS);
@@ -57,6 +62,7 @@ Timezone myTZ(myPST, myPDT);
 static void setSprinklerOn();
 static void setSprinklerOff();
 static void pulseLatch(int pin);
+static void scrollDisplayText(const char* str);
 
 void setup() {
   Serial.begin(115200);
@@ -75,14 +81,15 @@ void setup() {
   buttonHook.registerButton(BUTTON_B, &buttonBPressed);
   buttonHook.registerButton(BUTTON_C, &buttonCPressed);
 
-  display.begin(SSD1306_SWITCHCAPVCC, 0x3C);  // Address 0x3C for 128x32
+  display.begin(0x3C, true);
+  display.setRotation(1);
   Serial.println("OLED begun");
 
   displayOnWithTimeout();
 
-  display.dim(true);
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
+  display.setTextSize(2);
+  display.setTextWrap(false);
+  display.setTextColor(SH110X_WHITE);
   printDisplay("connecting internet...");
 
   WiFi.mode(WIFI_STA);
@@ -150,9 +157,15 @@ void loop() {
   if (sprinklerState == ON) {
     char buffer[64];
     unsigned long duration = millis() - sprinklerStart;
-    snprintf(buffer, sizeof(buffer), "Sprinkler running for\n%.2f min(s)",
-             duration / 60000.0);
-    printDisplay(buffer);
+    if (manualOverride != 0) {
+      unsigned long remaining = manualOverride - millis(); 
+      snprintf(buffer, sizeof(buffer), "Running:\n%.1f mins\nRemaining:\n%.1f mins",
+               duration / 60000.0, remaining / 60000.0);
+    } else {
+      snprintf(buffer, sizeof(buffer), "Running:\n%.1f mins",
+               duration / 60000.0);
+    }
+      printDisplay(buffer);
   } else {
     char buffer[sizeof(sprinklerStartDisplay) +
                 sizeof(sprinklerDurationDisplay) + 2];
@@ -185,12 +198,14 @@ void sprinklerOnButtonHandler(bool longPress) {
   }
   
   setSprinklerOn();
+  displayOnWithTimeout();
 }
 
 void sprinklerOffButtonHandler() {
   // Reset the override timeout and turn off the sprinkler
   manualOverride = 0;
   setSprinklerOff();
+  displayOnWithTimeout();
 }
 
 void sprinklerOnWebHandler() {
@@ -234,7 +249,6 @@ static void setSprinklerOn() {
   snprintf(sprinklerStartDisplay, sizeof(sprinklerStartDisplay),
            "Start:\n%d-%02d-%02d %02d:%02d", year(t), month(t), day(t), hour(t),
            minute(t));
-  displayOnWithTimeout();
   pulseLatch(TRIGGER_PIN_ON);
 }
 
@@ -248,9 +262,7 @@ static void setSprinklerOff() {
     sprinklerStart = 0;
 
     snprintf(sprinklerDurationDisplay, sizeof(sprinklerDurationDisplay),
-             "Duration:\n%.1f min(s)", duration / 60000.0);
-
-    displayOnWithTimeout();
+             "Duration:\n%.1f mins", duration / 60000.0);
   }
 
   // Always turn off to be safe
@@ -304,13 +316,107 @@ void printDisplay(const char* str) {
     return;
   }
 
-  display.setCursor(0, 0);
-  display.println(str);
+  scrollDisplayText(str);
   display.display();
   display.setCursor(0, 0);
 }
 
-void printDisplay(String str) { printDisplay(str.c_str()); }
+static void scrollDisplayText(const char* str) {
+  const char* lineStart = str;
+  int16_t y = 0;
+  int16_t maxScroll = 0;
+
+  while (lineStart != nullptr && y < display.height()) {
+    const char* lineEnd = strchr(lineStart, '\n');
+    size_t lineLength = lineEnd ? (size_t)(lineEnd - lineStart)
+                                : strlen(lineStart);
+    char line[64];
+    if (lineLength >= sizeof(line)) {
+      lineLength = sizeof(line) - 1;
+    }
+    memcpy(line, lineStart, lineLength);
+    line[lineLength] = '\0';
+
+    int16_t boundsX;
+    int16_t boundsY;
+    uint16_t textWidth;
+    uint16_t textHeight;
+    display.getTextBounds(line, 0, y, &boundsX, &boundsY, &textWidth,
+                          &textHeight);
+    if (textWidth > display.width() &&
+        textWidth - display.width() > maxScroll) {
+      maxScroll = textWidth - display.width();
+    }
+
+    if (!lineEnd) {
+      lineStart = nullptr;
+    } else {
+      lineStart = lineEnd + 1;
+    }
+    y += 16;
+  }
+
+  const unsigned long nowMs = millis();
+  if (maxScroll == 0) {
+    displayScrollOffset = 0;
+    displayScrollEndTime = 0;
+  } else if (maxScroll != displayMaxScroll) {
+    displayScrollOffset = min(displayScrollOffset, maxScroll);
+    displayScrollEndTime = displayScrollOffset == maxScroll ? nowMs : 0;
+  }
+  displayMaxScroll = maxScroll;
+
+  if (maxScroll > 0) {
+    if (displayScrollOffset < maxScroll && nowMs - lastDisplayScroll >= 35) {
+      ++displayScrollOffset;
+      lastDisplayScroll = nowMs;
+      if (displayScrollOffset == maxScroll) {
+        displayScrollEndTime = nowMs;
+      }
+    } else if (displayScrollOffset == maxScroll &&
+               nowMs - displayScrollEndTime >= 1000) {
+      displayScrollOffset = 0;
+      displayScrollEndTime = 0;
+      lastDisplayScroll = nowMs;
+    }
+  }
+
+  lineStart = str;
+  y = 0;
+  while (lineStart != nullptr && y < display.height()) {
+    const char* lineEnd = strchr(lineStart, '\n');
+    size_t lineLength = lineEnd ? (size_t)(lineEnd - lineStart)
+                                : strlen(lineStart);
+    char line[64];
+    if (lineLength >= sizeof(line)) {
+      lineLength = sizeof(line) - 1;
+    }
+    memcpy(line, lineStart, lineLength);
+    line[lineLength] = '\0';
+
+    int16_t boundsX;
+    int16_t boundsY;
+    uint16_t textWidth;
+    uint16_t textHeight;
+    display.getTextBounds(line, 0, y, &boundsX, &boundsY, &textWidth,
+                          &textHeight);
+    int16_t lineScroll = textWidth > display.width()
+                             ? textWidth - display.width()
+                             : 0;
+    int16_t offset = min(displayScrollOffset, lineScroll);
+    display.setCursor(-offset, y);
+    display.print(line);
+
+    if (!lineEnd) {
+      lineStart = nullptr;
+    } else {
+      lineStart = lineEnd + 1;
+    }
+    y += 16;
+  }
+
+}
+
 
 time_t getTime() { return ntpClient.getTime(); }
 
